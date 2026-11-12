@@ -2,6 +2,7 @@
 import math,hashlib,json
 from collections import defaultdict
 from statistics import mean
+from .feasibility import precheck
 DIMS=('age_band','mode','zone')
 def validate_targets(units,targets):
     if not units: raise ValueError('样本为空，请先导入样本')
@@ -29,31 +30,52 @@ def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
         if not all(dim in u and isinstance(u[dim],str) and u[dim] for dim in DIMS): raise ValueError('样本维度缺失')
         if not math.isfinite(u['base_weight']) or u['base_weight']<=0 or not math.isfinite(u['trip_minutes']) or u['trip_minutes']<0: raise ValueError('样本值必须为有限非负值，初始权重须正')
     margins,total=validate_targets(units,targets)
+    # 联合可行性预检：在消耗迭代预算之前先区分“结构无解 / 上限不足 / 暂未收敛”。
+    feasibility=precheck(units,targets,cap_ratio)
     initial=[u['base_weight'] for u in units];weights=[x*total/sum(initial) for x in initial]
     cap=cap_ratio*total/len(units)
-    trace=[];converged=False
-    for iteration in range(1,max_iterations+1):
-        for dim,margin in sorted(margins.items()):
-            current=defaultdict(float)
-            for u,w in zip(units,weights):current[u[dim]]+=w
-            factors={}
-            for cat,target in margin.items():
-                if current[cat]<=1e-15:
-                    if target>0: raise ValueError('零权重类别无法达到正目标，请检查交叉结构零')
-                    factors[cat]=0
-                else:factors[cat]=target/current[cat]
-            weights=[w*factors[u[dim]] for u,w in zip(units,weights)]
-        weights=[min(cap,w) for w in weights]
-        residual=0
+    trace=[];converged=False;iteration=0;residual=0.0
+    structurally_infeasible=feasibility['status']=='structurally_infeasible'
+    if structurally_infeasible:
+        # 结构无解时任何正权重都无法满足边际，迭代注定耗尽；只记录一次初始残差后停止。
+        iteration=1
         for dim,margin in margins.items():
             actual=defaultdict(float)
             for u,w in zip(units,weights):actual[u[dim]]+=w
-            residual=max(residual,max(abs(actual[cat]-target)/total for cat,target in margin.items()))
+            residual=max(residual,max(abs(actual[cat]-t)/total for cat,t in margin.items()))
         trace.append({'iteration':iteration,'max_residual':residual})
-        if residual<=tolerance:converged=True;break
+    else:
+        for iteration in range(1,max_iterations+1):
+            for dim,margin in sorted(margins.items()):
+                current=defaultdict(float)
+                for u,w in zip(units,weights):current[u[dim]]+=w
+                factors={}
+                for cat,target in margin.items():
+                    if current[cat]<=1e-15:
+                        if target>0: raise ValueError('零权重类别无法达到正目标，请检查交叉结构零')
+                        factors[cat]=0
+                    else:factors[cat]=target/current[cat]
+                weights=[w*factors[u[dim]] for u,w in zip(units,weights)]
+            weights=[min(cap,w) for w in weights]
+            residual=0
+            for dim,margin in margins.items():
+                actual=defaultdict(float)
+                for u,w in zip(units,weights):actual[u[dim]]+=w
+                residual=max(residual,max(abs(actual[cat]-target)/total for cat,target in margin.items()))
+            trace.append({'iteration':iteration,'max_residual':residual})
+            if residual<=tolerance:converged=True;break
     sum_w=sum(weights);sum_sq=sum(w*w for w in weights)
     if sum_w<=1e-12 or sum_sq<=1e-12:raise ValueError('有效权重总量为零')
     ess=sum_w*sum_w/sum_sq;deff=len(units)/ess
+    # 未收敛原因归类：结构无解 > 上限不足 > 暂未收敛（预检可行但迭代未达容差）。
+    if converged:
+        non_convergence_reason=None
+    elif structurally_infeasible:
+        non_convergence_reason='structurally_infeasible'
+    elif feasibility['status']=='cap_insufficient':
+        non_convergence_reason='cap_insufficient'
+    else:
+        non_convergence_reason='not_converged'
     diagnostics=[]
     for dim,margin in sorted(margins.items()):
         for cat,target in sorted(margin.items()):
@@ -62,4 +84,4 @@ def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
             diagnostics.append({'dimension':dim,'category':cat,'sample_count':len(indexes),'unweighted_share':len(indexes)/len(units),'target':target,'target_share':target/total,'weighted':actual,'weighted_share':actual/sum_w,'residual':actual-target})
     payload={'units':[{k:u[k] for k in ['code','zone','age_band','mode','trip_minutes','base_weight']} for u in units],'targets':targets,'tolerance':tolerance,'max_iterations':max_iterations,'cap_ratio':cap_ratio}
     checksum=hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-    return {'converged':converged,'iterations':iteration,'max_residual':residual,'target_total':total,'weight_total':sum_w,'sample_count':len(units),'effective_sample_size':ess,'design_effect':deff,'weight_min':min(weights),'weight_max':max(weights),'weight_cap':cap,'unweighted_mean':mean(u['trip_minutes'] for u in units),'weighted_mean':sum(u['trip_minutes']*w for u,w in zip(units,weights))/sum_w,'diagnostics':diagnostics,'trace':trace,'assignments':[dict(u,weight=w) for u,w in zip(units,weights)],'checksum':checksum,'method_note':'逐维IPF后截断权重，可能无法收敛；残差为类别绝对偏差除目标总量。Kish有效样本仅反映权重离散，不包含聚类/分层设计或未观测偏差。加权均值为描述性估计。'}
+    return {'converged':converged,'iterations':iteration,'max_residual':residual,'non_convergence_reason':non_convergence_reason,'feasibility':feasibility,'target_total':total,'weight_total':sum_w,'sample_count':len(units),'effective_sample_size':ess,'design_effect':deff,'weight_min':min(weights),'weight_max':max(weights),'weight_cap':cap,'unweighted_mean':mean(u['trip_minutes'] for u in units),'weighted_mean':sum(u['trip_minutes']*w for u,w in zip(units,weights))/sum_w,'diagnostics':diagnostics,'trace':trace,'assignments':[dict(u,weight=w) for u,w in zip(units,weights)],'checksum':checksum,'method_note':'逐维IPF后截断权重，可能无法收敛；残差为类别绝对偏差除目标总量。运行前已做联合可行性预检（feasibility 字段）区分结构无解、上限不足与暂未收敛。Kish有效样本仅反映权重离散，不包含聚类/分层设计或未观测偏差。加权均值为描述性估计。'}

@@ -36,7 +36,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 实现位置 `backend/src/services/raking_algorithm.py`。
 
 1. Raking/IPF：初始正权重归一到目标总量；按年龄组、方式、分区的固定顺序，用 target_category/current_category 乘法调整。每轮后按 cap_ratio × target_total / n 截断。误差是各类别绝对残差除共同目标总量，达到容差才声明收敛；截断不保持每轮总量，不可行目标可能不收敛，此时结果不能批准。此算法是有界迭代近似，不宣称约束最大熵的精确最优解。
-2. Kish有效样本 `ESS=(Σw)^2/Σw²`；设计效应 `n/ESS`；加权均值 `Σw*y/Σw`。这些量只反映权重离散与描述性估计，不包含聚类/分层设计，不保证校准已消除未观测选择偏差，也不作因果解释。
+2. 联合可行性预检（`backend/src/services/feasibility.py`，纯标准库）：每次校准在消耗迭代预算前先判定当前样本交叉结构与截断上限。三种结论——`feasible`（结构与上限均可行，未达标只算暂未收敛，可加迭代/收紧容差）、`cap_insufficient`（存在满足边际的非负权重但当前上限切空可行域，给出 `minimum_cap_ratio` 最小可行倍数与最紧的目标类别）、`structurally_infeasible`（任何正权重都无法同时满足边际，列出由最大流最小割见证的矛盾类别；两两 Hall 检查可解释、两阶段稀疏单纯形兜底三维联合 LP）。结构无解时不再空跑迭代，只记录一次初始残差。运行前可通过 `GET /batches/{id}/feasibility?cap_ratio=` 实时查看；诊断带样本维度与目标的 SHA256 短指纹，源数据或目标更新后指纹变化、旧诊断失效，页面重新拉取，不做服务端缓存。
+3. Kish有效样本 `ESS=(Σw)^2/Σw²`；设计效应 `n/ESS`；加权均值 `Σw*y/Σw`。这些量只反映权重离散与描述性估计，不包含聚类/分层设计，不保证校准已消除未观测选择偏差，也不作因果解释。
 
 参数：容差1e-6..0.05、迭代1..2000、截断倍数1..30，每批最多5000行。目标每维总量必须一致且正；重复目标、遗漏样本类别、正目标类别无样本支持、零权重支持、非有限/负值被拒绝。目标为零可使相应权重为零。所有影响结果的样本维度、初始权重、出行时长、边际与参数都进入SHA256，并按自然编号/类别排序；行序改变不改变结果。结果保存原始样本与目标诊断快照，后续目标变更不会回写历史运行。
 
@@ -44,7 +45,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 ## 页面与结构
 
-六个研究页面：总览、样本底册、目标边际、校准配置/记录、诊断结果、复核交付（含有权角色的审计）。BatchSelect、RunTable、CalibrationSummary、MarginTable跨页复用；PageHeading/ErrorNotice/StatusBadge为公共组件；useTask/usePolling与格式工具共享。初始3批共1280条样本、27个目标格、一个实际计算的初始运行及获批记录，种子73/74/75。
+六个研究页面：总览、样本底册、目标边际、校准配置/记录、诊断结果、复核交付（含有权角色的审计）。BatchSelect、RunTable、CalibrationSummary、MarginTable、FeasibilityPanel跨页复用；PageHeading/ErrorNotice/StatusBadge为公共组件；useTask/usePolling与格式工具共享。校准页在提交前实时显示联合可行性预检（随批次与截断倍数重算，指纹识别失效），结构无解或口径不合法时阻止提交，上限不足可一键采用最小可行倍数；结果页把未收敛细分为结构无解/上限不足/暂未收敛并保留矛盾类别。初始3批共1280条样本、27个目标格、一个实际计算的初始运行及获批记录，种子73/74/75。
 
 前端：`src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；后端：`src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；种子在`backend/scripts/seed_demo.py`，结构约束见`backend/migrations/001_schema.md`。测试、截图和TESTING只在批次`test-artifacts/gb-0015/`。
 
